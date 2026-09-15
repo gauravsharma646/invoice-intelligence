@@ -1,23 +1,46 @@
-from fastapi import FastAPI, Depends
+import os
+
+from fastapi import (
+    FastAPI,
+    Depends,
+    UploadFile,
+    File
+)
+
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import Invoice, Payment
 from .schemas import InvoiceCreate, PaymentCreate
 from .reconciliation import reconcile_invoice
+from .redis_client import (
+    check_invoice_processed,
+    mark_invoice_processed
+)
+from .ocr_service import extract_invoice_data
 
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="Invoice Intelligence & Reconciliation API"
+    title="Invoice Intelligence & Reconciliation API",
+    version="2.0"
+)
+
+
+UPLOAD_DIR = "uploads"
+
+os.makedirs(
+    UPLOAD_DIR,
+    exist_ok=True
 )
 
 
 @app.get("/")
 def home():
     return {
-        "message": "Invoice Intelligence API is running"
+        "message": "Invoice Intelligence API is running",
+        "version": "2.0"
     }
 
 
@@ -26,6 +49,7 @@ def create_invoice(
     invoice: InvoiceCreate,
     db: Session = Depends(get_db)
 ):
+
     new_invoice = Invoice(
         invoice_number=invoice.invoice_number,
         vendor_name=invoice.vendor_name,
@@ -46,6 +70,7 @@ def create_payment(
     payment: PaymentCreate,
     db: Session = Depends(get_db)
 ):
+
     new_payment = Payment(
         transaction_id=payment.transaction_id,
         invoice_number=payment.invoice_number,
@@ -66,6 +91,7 @@ def reconcile(
     invoice_number: str,
     db: Session = Depends(get_db)
 ):
+
     invoice = (
         db.query(Invoice)
         .filter(
@@ -93,4 +119,58 @@ def reconcile(
     return {
         "invoice_number": invoice_number,
         "result": result
+    }
+
+
+@app.post("/invoices/upload")
+async def upload_invoice(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+
+    file_path = os.path.join(
+        UPLOAD_DIR,
+        file.filename
+    )
+
+    with open(file_path, "wb") as buffer:
+        buffer.write(
+            await file.read()
+        )
+
+    extracted_data = extract_invoice_data(
+        file_path
+    )
+
+    invoice_number = extracted_data.get(
+        "invoice_number"
+    )
+
+    if not invoice_number:
+        return {
+            "error": "Invoice number could not be extracted",
+            "ocr_data": extracted_data
+        }
+
+    existing_result = check_invoice_processed(
+        invoice_number
+    )
+
+    if existing_result:
+
+        return {
+            "message": "Invoice already processed",
+            "invoice_number": invoice_number,
+            "status": existing_result
+        }
+
+    mark_invoice_processed(
+        invoice_number,
+        "OCR_PROCESSED"
+    )
+
+    return {
+        "message": "Invoice uploaded and processed",
+        "invoice_number": invoice_number,
+        "ocr_data": extracted_data
     }
